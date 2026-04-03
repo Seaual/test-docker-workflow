@@ -47,7 +47,8 @@ on:
 # 环境变量
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  # GitHub 仓库名转小写 (Docker 镜像名必须小写)
+  IMAGE_NAME: ${{ github.repository_owner | lower }}/${{ github.event.repository.name | lower }}
   TRIVY_VERSION: '0.58.0'
 
 jobs:
