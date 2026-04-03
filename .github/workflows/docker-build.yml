@@ -47,8 +47,6 @@ on:
 # 环境变量
 env:
   REGISTRY: ghcr.io
-  # github.repository 已经是 owner/repo 格式且为小写
-  IMAGE_NAME: ${{ github.repository }}
   TRIVY_VERSION: '0.58.0'
 
 jobs:
@@ -66,10 +64,19 @@ jobs:
     outputs:
       image-digest: ${{ steps.build.outputs.digest }}
       image-tags: ${{ steps.meta.outputs.tags }}
+      image-name-lower: ${{ steps.set-image-name.outputs.image-name }}
     
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      
+      - name: Set lowercase image name
+        id: set-image-name
+        run: |
+          # Convert repository name to lowercase (Docker requirement)
+          IMAGE_NAME=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "image-name=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "Using image name: $IMAGE_NAME"
       
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -103,7 +110,7 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            ${{ env.REGISTRY }}/${{ steps.set-image-name.outputs.image-name }}
           tags: |
             # 分支
             type=ref,event=branch
@@ -167,14 +174,14 @@ jobs:
       - name: Pull image for scanning
         run: |
           # 从 GHCR 拉取刚构建的镜像 (使用 main 标签)
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main"
+          IMAGE="${{ env.REGISTRY }}/${{ needs.build.outputs.image-name-lower }}:main"
           echo "拉取镜像：$IMAGE"
           docker pull "$IMAGE"
       
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@v0.35.0
         with:
-          image-ref: '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main'
+          image-ref: '${{ env.REGISTRY }}/${{ needs.build.outputs.image-name-lower }}:main'
           format: 'sarif'
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH,MEDIUM'
@@ -195,8 +202,8 @@ jobs:
           echo "## 🔒 Trivy 安全扫描报告" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          # 生成文本格式报告
-          trivy image --format table '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}' >> trivy-report.txt 2>/dev/null || echo "扫描完成，详细报告见 Security 标签" >> trivy-report.txt
+          # 生成文本格式报告 (使用 main 标签)
+          trivy image --format table '${{ env.REGISTRY }}/${{ needs.build.outputs.image-name-lower }}:main' >> trivy-report.txt 2>/dev/null || echo "扫描完成，详细报告见 Security 标签" >> trivy-report.txt
           
           echo '```' >> $GITHUB_STEP_SUMMARY
           cat trivy-report.txt >> $GITHUB_STEP_SUMMARY
@@ -239,7 +246,7 @@ jobs:
       
       - name: Verify image in registry
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          IMAGE="${{ env.REGISTRY }}/${{ needs.build.outputs.image-name-lower }}"
           # 使用 main 标签验证 (这是 build job 实际推送的标签)
           TAG="main"
           
@@ -247,7 +254,7 @@ jobs:
           
           # 使用 curl 验证镜像是否存在
           if curl -s -f -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "https://${{ env.REGISTRY }}/v2/${{ env.IMAGE_NAME }}/manifests/$TAG" > /dev/null; then
+            "https://${{ env.REGISTRY }}/v2/${{ needs.build.outputs.image-name-lower }}/manifests/$TAG" > /dev/null; then
             echo "✅ 镜像已成功推送到 registry"
           else
             echo "⚠️ 镜像可能未推送或验证失败"
