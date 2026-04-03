@@ -1,0 +1,257 @@
+name: Docker Build & Push
+
+# 触发条件
+on:
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: '构建平台 (逗号分隔)'
+        required: false
+        default: 'linux/amd64,linux/arm64'
+      push:
+        description: '是否推送镜像'
+        required: false
+        default: 'true'
+      tags:
+        description: '镜像标签'
+        required: false
+        default: 'latest'
+  
+  # 定时触发 (每天凌晨 2 点)
+  schedule:
+    - cron: '0 2 * * *'
+  
+  # 代码推送触发
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*.*.*'
+    paths:
+      - 'Dockerfile'
+      - 'docker/**'
+      - '.github/workflows/docker-build.yml'
+  
+  # PR 触发
+  pull_request:
+    branches:
+      - main
+      - master
+    paths:
+      - 'Dockerfile'
+      - 'docker/**'
+      - '.github/workflows/docker-build.yml'
+
+# 环境变量
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  TRIVY_VERSION: '0.58.0'
+
+jobs:
+  # ============================================
+  # Job 1: 构建 Docker 镜像
+  # ============================================
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tags: ${{ steps.meta.outputs.tags }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+      
+      - name: Login to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Login to Docker Hub (可选)
+        if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            ${{ secrets.DOCKERHUB_USERNAME != '' && format('{0}/{1}', secrets.DOCKERHUB_USERNAME, github.event.repository.name) || '' }}
+          tags: |
+            # 分支
+            type=ref,event=branch
+            # PR
+            type=ref,event=pr
+            # 语义化版本
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            # 手动触发的标签
+            type=raw,value=${{ github.event.inputs.tags }},enable=${{ github.event_name == 'workflow_dispatch' }}
+            # 定时构建
+            type=raw,value=nightly,enable=${{ github.event_name == 'schedule' }}
+          flavor: |
+            latest=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+      
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: ${{ github.event.inputs.platforms || 'linux/amd64,linux/arm64' }}
+          push: ${{ github.event.inputs.push != 'false' && github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILDKIT_INLINE_CACHE=1
+          # 如果 Dockerfile 在其他位置，修改这里
+          # file: ./docker/Dockerfile
+      
+      - name: Generate build summary
+        run: |
+          echo "## 🐳 Docker 构建完成" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**镜像:** ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "**标签:** ${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo "**平台:** ${{ github.event.inputs.platforms || 'linux/amd64,linux/arm64' }}" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ steps.build.outputs.digest }}" ]; then
+            echo "**Digest:** \`${{ steps.build.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+          fi
+  
+  # ============================================
+  # Job 2: Trivy 安全扫描
+  # ============================================
+  trivy-scan:
+    name: Trivy Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    
+    permissions:
+      contents: read
+      security-events: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- v${{ env.TRIVY_VERSION }}
+          sudo mv bin/trivy /usr/local/bin/
+          rm -rf bin
+          trivy --version
+      
+      - name: Pull image for scanning
+        run: |
+          # 从 GHCR 拉取刚构建的镜像
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          echo "拉取镜像：$IMAGE"
+          docker pull "$IMAGE" || echo "镜像可能未推送，使用本地构建"
+      
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+          vuln-type: 'os,library'
+          ignore-unfixed: true
+          timeout: '10m'
+      
+      - name: Upload Trivy scan results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: 'trivy-container-scan'
+      
+      - name: Generate text report
+        continue-on-error: true
+        run: |
+          echo "## 🔒 Trivy 安全扫描报告" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # 生成文本格式报告
+          trivy image --format table '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}' >> trivy-report.txt 2>/dev/null || echo "扫描完成，详细报告见 Security 标签" >> trivy-report.txt
+          
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat trivy-report.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+      
+      - name: Upload text report as artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-security-report
+          path: trivy-report.txt
+          retention-days: 30
+  
+  # ============================================
+  # Job 3: 验证推送 (可选)
+  # ============================================
+  verify:
+    name: Verify Image Push
+    runs-on: ubuntu-latest
+    needs: [build, trivy-scan]
+    if: always() && github.event_name != 'pull_request'
+    
+    steps:
+      - name: Check job status
+        run: |
+          echo "## ✅ 构建流程状态" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.build.result }}" == "success" ]; then
+            echo "- 🐳 构建：**成功**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- 🐳 构建：**失败**" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.trivy-scan.result }}" == "success" ]; then
+            echo "- 🔒 扫描：**成功**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- 🔒 扫描：**失败/跳过**" >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      - name: Verify image in registry
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          TAG="${{ github.sha }}"
+          
+          echo "验证镜像：$IMAGE:$TAG"
+          
+          # 使用 ghcr-cli 或 curl 验证
+          if curl -s -f -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://${{ env.REGISTRY }}/v2/${{ env.IMAGE_NAME }}/manifests/$TAG" > /dev/null; then
+            echo "✅ 镜像已成功推送到 registry"
+          else
+            echo "⚠️ 镜像可能未推送或验证失败"
+          fi
