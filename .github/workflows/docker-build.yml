@@ -163,24 +163,22 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       
-      - name: Install Trivy
-        run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- v${{ env.TRIVY_VERSION }}
-          sudo mv bin/trivy /usr/local/bin/
-          rm -rf bin
-          trivy --version
+      - name: Set up Trivy
+        uses: aquasecurity/setup-trivy@v1
+        with:
+          trivy-version: v${{ env.TRIVY_VERSION }}
       
       - name: Pull image for scanning
         run: |
-          # 从 GHCR 拉取刚构建的镜像
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          # 从 GHCR 拉取刚构建的镜像 (使用 main 标签)
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main"
           echo "拉取镜像：$IMAGE"
           docker pull "$IMAGE" || echo "镜像可能未推送，使用本地构建"
       
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@v0.35.0
         with:
-          image-ref: '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}'
+          image-ref: '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main'
           format: 'sarif'
           output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH,MEDIUM'
@@ -245,14 +243,16 @@ jobs:
       - name: Verify image in registry
         run: |
           IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          TAG="${{ github.sha }}"
+          # 使用 main 标签验证 (这是 build job 实际推送的标签)
+          TAG="main"
           
           echo "验证镜像：$IMAGE:$TAG"
           
-          # 使用 ghcr-cli 或 curl 验证
+          # 使用 curl 验证镜像是否存在
           if curl -s -f -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             "https://${{ env.REGISTRY }}/v2/${{ env.IMAGE_NAME }}/manifests/$TAG" > /dev/null; then
             echo "✅ 镜像已成功推送到 registry"
           else
             echo "⚠️ 镜像可能未推送或验证失败"
+            exit 1
           fi
