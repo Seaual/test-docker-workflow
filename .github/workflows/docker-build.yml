@@ -178,7 +178,7 @@ jobs:
           docker pull "$IMAGE" || echo "镜像可能未推送，使用本地构建"
       
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.35.0
         with:
           image-ref: '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}'
           format: 'sarif'
